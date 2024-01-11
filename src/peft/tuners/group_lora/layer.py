@@ -286,15 +286,17 @@ class Linear(nn.Module, group_LoraLayer):
         # else: #需要用adapter，但是没有merge
         result = self.base_layer(x, *args, **kwargs)
         delta_hiddens = {}
-        for active_adapter in self.active_adapters:
-            if active_adapter not in self.lora_A.keys():
-                continue
+        for active_adapter in self.lora_A.keys():
+            # if active_adapter not in self.lora_A.keys():
+            #     continue
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
             scaling = self.scaling[active_adapter]
             x = x.to(lora_A.weight.dtype)
-            delta_hiddens[active_adapter] = lora_B(lora_A(dropout(x))) * scaling
+            delta_hidden = lora_B(lora_A(dropout(x))) * scaling
+            delta_hiddens[active_adapter] = self.attention_gate_layernorm(delta_hidden)
+            
         
         with torch.no_grad():
             hidden = result = self.base_layer(x, *args, **kwargs)
@@ -313,6 +315,145 @@ class Linear(nn.Module, group_LoraLayer):
 
 
 
+        result = result.to(previous_dtype)
+        return result
+
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "grouplora." + rep
+    
+
+### for try avg directly
+
+class AvgLinear(nn.Module, group_LoraLayer):
+    # Lora implemented in a dense layer
+    def __init__(
+        self,
+        base_layer,
+        adapter_name: str,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.0,
+        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        is_target_conv_1d_layer: bool = False,
+        init_lora_weights: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        group_LoraLayer.__init__(self, base_layer)
+        self.fan_in_fan_out = fan_in_fan_out
+
+        self._active_adapter = adapter_name
+        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.is_target_conv_1d_layer = is_target_conv_1d_layer
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If True, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`List[str]`, *optional*):
+                The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
+                to `None`.
+        """
+        if self.merged:
+            warnings.warn(
+                f"Already following adapters were merged {','.join(self.merged_adapters)}. "
+                f"You are now additionally merging {','.join(self.active_adapters)}."
+            )
+
+        if adapter_names is None:
+            adapter_names = self.active_adapters
+
+        for active_adapter in adapter_names:
+            if active_adapter in self.lora_A.keys():
+                base_layer = self.get_base_layer()
+                if safe_merge:
+                    # Note that safe_merge will be slower than the normal merge
+                    # because of the copy operation.
+                    orig_weights = base_layer.weight.data.clone()
+                    orig_weights += self.get_delta_weight(active_adapter)
+
+                    if not torch.isfinite(orig_weights).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                        )
+
+                    base_layer.weight.data = orig_weights
+                else:
+                    base_layer.weight.data += self.get_delta_weight(active_adapter)
+                self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter in self.lora_A.keys():
+                self.get_base_layer().weight.data -= self.get_delta_weight(active_adapter)
+
+    def get_delta_weight(self, adapter) -> torch.Tensor:
+        """
+        Compute the delta weight for the given adapter.
+
+        Args:
+            adapter (str):
+                The name of the adapter for which the delta weight should be computed.
+        """
+        device = self.lora_B[adapter].weight.device
+        dtype = self.lora_B[adapter].weight.dtype
+
+        # In case users wants to merge the adapter weights that are in
+        # float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
+        # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
+        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+
+        weight_A = self.lora_A[adapter].weight
+        weight_B = self.lora_B[adapter].weight
+
+        if cast_to_fp32:
+            weight_A = weight_A.float()
+            weight_B = weight_B.float()
+
+        output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+
+        if cast_to_fp32:
+            output_tensor = output_tensor.to(dtype=dtype)
+
+            # cast back the weights
+            self.lora_A[adapter].weight.data = weight_A.to(dtype)
+            self.lora_B[adapter].weight.data = weight_B.to(dtype)
+
+        return output_tensor
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        previous_dtype = x.dtype
+
+        # if self.disable_adapters:
+        #     if self.merged:
+        #         self.unmerge()
+        #     result = self.base_layer(x, *args, **kwargs)
+        # elif self.merged:
+        #     result = self.base_layer(x, *args, **kwargs)
+        # else: #需要用adapter，但是没有merge
+        result = self.base_layer(x, *args, **kwargs)
+        delta_hiddens = {}
+        for active_adapter in self.lora_A.keys():
+            lora_A = self.lora_A[active_adapter]
+            lora_B = self.lora_B[active_adapter]
+            dropout = self.lora_dropout[active_adapter]
+            scaling = self.scaling[active_adapter]
+            x = x.to(lora_A.weight.dtype)
+            delta_hiddens[active_adapter] = lora_B(lora_A(dropout(x))) * scaling
+            # result += delta_hiddens[active_adapter]*(1/len(self.lora_A.keys()))
+        result+=0.7*delta_hiddens['code']
+        result+=0.3*delta_hiddens['zh']
         result = result.to(previous_dtype)
         return result
 
