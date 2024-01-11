@@ -20,7 +20,7 @@ Some fine-tuning techniques, such as prompt tuning, are specific to language mod
 assumed a 🤗 Transformers model is being used. However, other fine-tuning techniques - like
 [LoRA](../conceptual_guides/lora) - are not restricted to specific model types.
 
-In this guide, we will see how LoRA can be applied to a multilayer perceptron and a computer vision model from the [timm](https://huggingface.co/docs/timm/index) library.
+In this guide, we will see how LoRA can be applied to a multilayer perceptron, a computer vision model from the [timm](https://huggingface.co/docs/timm/index) library, or a new 🤗 Transformers architectures.
 
 ## Multilayer perceptron
 
@@ -104,7 +104,7 @@ Finally, we can use any training framework we like, or write our own fit loop, t
 
 For a complete example, check out [this notebook](https://github.com/huggingface/peft/blob/main/examples/multilayer_perceptron/multilayer_perceptron_lora.ipynb).
 
-## timm model
+## timm models
 
 The [timm](https://huggingface.co/docs/timm/index) library contains a large number of pretrained computer vision models.
 Those can also be fine-tuned with PEFT. Let's check out how this works in practice.
@@ -199,3 +199,44 @@ peft_model.print_trainable_parameters()
 This shows us that we only need to train less than 2% of all parameters, which is a huge efficiency gain.
 
 For a complete example, check out [this notebook](https://github.com/huggingface/peft/blob/main/examples/image_classification/image_classification_timm_peft_lora.ipynb).
+
+## New transformers architectures
+
+When new popular transformers architectures are released, we do our best to quickly add them to PEFT. If you come across a transformers model that is not supported out of the box, don't worry, it will most likely still work if the config is set correctly. Specifically, you have to identify the layers that should be adapted and set them correctly when initializing the corresponding config class, e.g. `LoraConfig`. Here are some tips to help with this.
+
+As a first step, it is a good idea is to check the existing models for inspiration. You can find them inside of [constants.py](https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py) in the PEFT repository. Often, you'll find a similar architecture that uses the same names. For example, if the new model architecture is a variation of the "mistral" model and you want to apply LoRA, you can see that the entry for "mistral" in `TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING` contains `["q_proj", "v_proj"]`. This tells you that for "mistral" models, the `target_modules` for LoRA should be `["q_proj", "v_proj"]`:
+
+```python
+from peft import LoraConfig, get_peft_model
+
+my_mistral_model = ...
+config = LoraConfig(
+    target_modules=["q_proj", "v_proj"],
+    ...,  # other LoRA arguments
+)
+peft_model = get_peft_model(my_mistral_model, config)
+```
+
+If that doesn't help, check the existing modules in your model architecture with the `named_modules` method and try to identify the attention layers, especially the key, query, and value layers. Those will often have names such as `c_attn`, `query`, `q_proj`, etc. The key layer is not always adapted, and ideally, you should check whether including it results in better performance.
+
+Additionally, linear layers are common targets to be adapted (e.g. in [QLoRA paper](https://arxiv.org/abs/2305.14314), authors suggest to adapt them as well). Their names will often contain the strings `fc` or `dense`.
+
+If you want to add a new model to PEFT, please create an entry in [constants.py](https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py) and open a pull request on the [repository](https://github.com/huggingface/peft/pulls). Don't forget to update the [README](https://github.com/huggingface/peft#models-support-matrix) as well.
+
+## Checking the result
+
+When you think that you have correctly specified the `target_modules` and called `get_peft_model`, you can check the fraction of parameters that will be trainable like this:
+
+```python
+peft_model.print_trainable_parameters()
+```
+
+If this number is too low or high, check the model `repr` by printing the model. This will show you the names and type of all of all the layers in the model. Ensure that the intended layers, and only those, are replaced by adapter layers. For instance, for LoRA applied to `nn.Linear` layers, you should see that `lora.Linear` layers are being used.
+
+To get a quick overview of all layers that were adapted, you can also use the the `targeted_module_names` attribute:
+
+```python
+print(peft_model.targeted_module_names)
+```
+
+This lists the names of each module that was actually adapted.
