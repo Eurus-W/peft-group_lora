@@ -297,18 +297,35 @@ class Linear(nn.Module, LoraLayer):
             self.lora_B[adapter].weight.data = weight_B.to(dtype)
 
         return output_tensor
+    
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    # def get_combined_delta_hiddens(self, loras, x, lora_weights):
+    #         # import pdb
+    #         # pdb.set_trace()
+    #         #lora_weights: (batch_size, len_q, len(loras),1) 做过unsqueeze了
+    #         delta_hiddens = {}
+    #         for lora_name in loras.keys():
+    #             delta_hiddens[lora_name] = loras[lora_name](x)
+    #         delta_hiddens = [delta_hidden for delta_hidden in delta_hiddens.values()]
+    #         delta_hiddens = torch.stack(delta_hiddens, dim=-1) #(batch_size, len_q, num_heads * dim_head, len(loras)
+    #         combined_delta_hiddens = torch.matmul(delta_hiddens, lora_weights) #(8,4096,4096,2) 
+    #         combined_delta_hiddens = combined_delta_hiddens.sum(dim=-1)
+    #         return combined_delta_hiddens
+    
+    def forward(self, x: torch.Tensor,lora_weights = None) -> torch.Tensor:
         previous_dtype = x.dtype
 
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
-            result = self.base_layer(x, *args, **kwargs)
+            result = self.base_layer(x)
         elif self.merged:
-            result = self.base_layer(x, *args, **kwargs)
+            result = self.base_layer(x)
         else:
-            result = self.base_layer(x, *args, **kwargs)
+            result = self.base_layer(x)
+            delta_hiddens = {}
+            # import pdb
+            # pdb.set_trace()
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
@@ -317,10 +334,43 @@ class Linear(nn.Module, LoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
-                result += lora_B(lora_A(dropout(x))) * scaling
+                delta_hiddens[active_adapter] =  lora_B(lora_A(dropout(x))) * scaling
+
+            # import pdb
+            # pdb.set_trace()
+            delta_hiddens = [delta_hidden for delta_hidden in delta_hiddens.values()]
+            delta_hiddens = torch.stack(delta_hiddens, dim=-1)
+            combined_delta_hiddens = torch.matmul(delta_hiddens, lora_weights)
+            combined_delta_hiddens = combined_delta_hiddens.sum(dim=-1)
+
+        result += combined_delta_hiddens
 
         result = result.to(previous_dtype)
         return result
+
+    # def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    #     previous_dtype = x.dtype
+
+    #     if self.disable_adapters:
+    #         if self.merged:
+    #             self.unmerge()
+    #         result = self.base_layer(x, *args, **kwargs)
+    #     elif self.merged:
+    #         result = self.base_layer(x, *args, **kwargs)
+    #     else:
+    #         result = self.base_layer(x, *args, **kwargs)
+    #         for active_adapter in self.active_adapters:
+    #             if active_adapter not in self.lora_A.keys():
+    #                 continue
+    #             lora_A = self.lora_A[active_adapter]
+    #             lora_B = self.lora_B[active_adapter]
+    #             dropout = self.lora_dropout[active_adapter]
+    #             scaling = self.scaling[active_adapter]
+    #             x = x.to(lora_A.weight.dtype)
+    #             result += lora_B(lora_A(dropout(x))) * scaling
+
+    #     result = result.to(previous_dtype)
+    #     return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()
